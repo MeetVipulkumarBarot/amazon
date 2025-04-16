@@ -1,54 +1,59 @@
 import asyncio
+import logging
+import time
 from apply import apply_to_job
 from notifier import send_email
 from dotenv import load_dotenv
 import os
 
-# Load environment variables from .env file
-load_dotenv()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Ensure the required environment variables are loaded
+# Load environment variables with explicit path if needed
+env_path = '/.env'  # Update this
+load_dotenv(env_path)
+
+# Environment variables verification
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASS = os.getenv("SENDER_PASS")
 
-# Check if environment variables are set correctly
 if not SENDER_EMAIL or not SENDER_PASS:
-    print("❌ Error: SENDER_EMAIL or SENDER_PASS is not set in the environment.")
+    logger.error("❌ SENDER_EMAIL or SENDER_PASS not set")
     exit(1)
 
-# Define a test job for applying to
 test_job = {
     "job_id": "TEST123",
     "title": "Amazon Warehouse Associate",
     "location": "Cambridge, ON",
-    "link": "https://hiring.amazon.ca/search/warehouse-jobs#/"  # Use a real job link for testing
+    "link": "https://hiring.amazon.ca/search/warehouse-jobs#/"
 }
 
-# Function to send a test email
 def test_send_email():
     try:
-        print("🚀 Attempting to send a test email...")
+        logger.info("🚀 Attempting to send test email...")
         send_email("✅ Test Subject", "This is a test body message.")
-        print("✅ Test email sent successfully!")
+        logger.info("✅ Test email sent!")
     except Exception as e:
-        print(f"❌ Failed to send test email: {e}")
+        logger.error(f"❌ Email failed: {e}", exc_info=True)
 
-# Main async function to apply to a job
 async def main():
     try:
-        print(f"🚀 Applying to job: {test_job['title']} in {test_job['location']}")
+        logger.info(f"🚀 Applying to {test_job['title']}")
+        start_time = time.time()
         await apply_to_job(test_job)
-        print("✅ Job application process completed!")
+        logger.info(f"✅ Application completed in {time.time()-start_time:.2f}s")
     except Exception as e:
-        print(f"❌ Failed to apply to the job: {e}")
+        logger.error(f"❌ Application failed: {e}", exc_info=True)
 
-# Test email sending first
-test_send_email()
-
-# Run the job application process
 if __name__ == "__main__":
-    asyncio.run(main())
-
-# Print loaded email credentials for verification
-print(f"SENDER_EMAIL: {SENDER_EMAIL}, SENDER_PASS: {SENDER_PASS}")  # Just for checking
-
+    logger.info("=== Starting Tests ===")
+    test_send_email()
+    
+    start_total = time.time()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+    logger.info(f"=== Total execution: {time.time()-start_total:.2f}s ===")
+    
+    # Credentials verification
+    logger.info(f"Credentials check - Email: {'set' if SENDER_EMAIL else 'not set'}")
