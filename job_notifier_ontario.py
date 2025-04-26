@@ -1,128 +1,157 @@
-# job_notifier_ontario.py
-
-import asyncio
+import os
+import time
 import random
+import requests
 from dotenv import load_dotenv
 from notifier import send_email
-from playwright.async_api import async_playwright
 
-load_dotenv()  # loads SENDER_EMAIL, SENDER_PASS, RECEIVER_EMAIL
+# ─── Load creds and token ──────────────────────────────────────────────────────
+load_dotenv()
+SENDER_EMAIL   = os.getenv("SENDER_EMAIL")
+SENDER_PASS    = os.getenv("SENDER_PASS")
+RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
+AUTH_TOKEN     = os.getenv("AMAZON_AUTH_TOKEN")
+GRAPHQL_URL    = os.getenv(
+    "AMAZON_GRAPHQL_URL",
+    "https://e5mquma77feepi2bdn4d6h3mpu.appsync-api.us-east-1.amazonaws.com/graphql"
+)
 
-async def apply_filters(page):
-    # 1) Set Location → Ontario, Canada
-    await page.wait_for_selector(
-        'button[data-test-id="navigationLocationButton"]',
-        state="visible"
-    )
-    await page.click(
-        'button[data-test-id="navigationLocationButton"]',
-        force=True
-    )
-    await page.wait_for_selector(
-        '[data-test-id="zipcodeInputField"] input',
-        state="visible"
-    )
-    await page.fill(
-        '[data-test-id="zipcodeInputField"] input',
-        "Ontario, Canada"
-    )
-    await page.keyboard.press("Enter")
-    await page.wait_for_timeout(1000)
+if not (SENDER_EMAIL and SENDER_PASS and RECEIVER_EMAIL):
+    raise RuntimeError("Missing SENDER_EMAIL, SENDER_PASS or RECEIVER_EMAIL in .env")
+if not AUTH_TOKEN:
+    raise RuntimeError("Missing AMAZON_AUTH_TOKEN in .env")
 
-    # 2) Set Job keyword → warehouse
-    await page.wait_for_selector(
-        'button[aria-label="Focus search bar button"]',
-        state="visible"
-    )
-    await page.click(
-        'button[aria-label="Focus search bar button"]',
-        force=True
-    )
-    await page.wait_for_selector(
-        '[data-test-id="navigationSearchField"] input',
-        state="visible"
-    )
-    await page.fill(
-        '[data-test-id="navigationSearchField"] input',
-        "warehouse"
-    )
-    await page.keyboard.press("Enter")
-    await page.wait_for_timeout(1000)
+# ─── The exact query your browser sends ────────────────────────────────────────
+SEARCH_QUERY = r"""
+query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+  searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+    jobCards {
+      jobId
+      jobTitle
+      locationName
+      scheduleCount
+      employmentTypeL10N
+      totalPayRateMinL10N
+      totalPayRateMaxL10N
+    }
+  }
+}
+"""
 
-async def monitor_jobs():
-    seen = set()
-    print("🔍 Monitoring Ontario warehouse jobs…")
+def fetch_jobs():
+    payload = {
+      "operationName": "searchJobCardsByLocation",
+      "query": SEARCH_QUERY,
+      "variables": {
+        "searchJobRequest": {
+          "locale":       "en-CA",
+          "country":      "Canada",
+          "keyWords":     "warehouse",
+          "equalFilters": [],
+          "offset":       0,
+          "pageSize":     100,
+          "distance":     None,
+          "postalCode":   None,
+          "sortBy":       None,
+          "mapBounds":    None
+        }
+      }
+    }
+    headers = {
+      "Content-Type":  "application/json",
+      "Accept":        "*/*",
+      "Origin":        "https://hiring.amazon.ca",
+      "Referer":       "https://hiring.amazon.ca/",
+      "authorization": f"Bearer {AUTH_TOKEN}",
+      "country":       "Canada",
+      "iscanary":      "false"
+    }
 
-    # SMTP sanity check
+    resp = requests.post(GRAPHQL_URL, json=payload, headers=headers)
     try:
-        send_email("🔥 TEST ALERT", "Confirming that SMTP works from this VM.")
+        resp.raise_for_status()
+    except Exception as e:
+        print("❌ HTTP error:", e, resp.text)
+        return []
+
+    try:
+        js = resp.json()
+    except ValueError as e:
+        print("❌ Failed to parse JSON:", e, resp.text)
+        return []
+
+    # drill down safely
+    data = js.get("data")
+    if not isinstance(data, dict):
+        print("⚠️ No `data` in GraphQL response:", js)
+        return []
+    response = data.get("searchJobCardsByLocation")
+    if not isinstance(response, dict):
+        print("⚠️ No `searchJobCardsByLocation` in data:", js)
+        return []
+    cards = response.get("jobCards")
+    if not isinstance(cards, list):
+        print("⚠️ `jobCards` is not a list:", js)
+        return []
+
+    return cards
+
+def main():
+    seen = set()
+    print("🔍 Monitoring Ontario warehouse jobs via GraphQL…")
+
+    # SMTP smoke-test
+    try:
+        send_email("🔥 TEST ALERT", "GraphQL notifier is running.")
         print("📧 Test alert sent.")
     except Exception as e:
-        print("❌ Test alert failed:", e)
+        print("❌ SMTP test failed:", e)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            locale="en-CA", timezone_id="America/Toronto"
-        )
-        page = await context.new_page()
+    while True:
+        try:
+            cards = fetch_jobs()
+            if not cards:
+                print("⏳ No new jobs right now.")
+            else:
+                for c in cards:
+                    jid = c.get("jobId")
+                    if not jid or jid in seen:
+                        continue
+                    seen.add(jid)
 
-        while True:
-            try:
-                # 1) Reload the search page
-                await page.goto(
-                    "https://hiring.amazon.ca/search/warehouse-jobs#/",
-                    timeout=60000
-                )
+                    title    = c.get("jobTitle",            "N/A")
+                    location = c.get("locationName",        "N/A")
+                    shifts   = c.get("scheduleCount",       "N/A")
+                    emp_type = c.get("employmentTypeL10N",  "N/A")
+                    pm       = c.get("totalPayRateMinL10N", "")
+                    px       = c.get("totalPayRateMaxL10N", "")
+                    pay      = f"{pm} – {px}" if pm and px else (pm or px or "N/A")
 
-                # 2) Apply filters
-                await apply_filters(page)
+                    link = (
+                        f"https://hiring.amazon.ca/app#/jobSearch?"
+                        f"jobId={jid}&locale=en-CA"
+                    )
 
-                # 3) Let the UI settle
-                await page.wait_for_timeout(2000)
+                    body = "\n".join([
+                        "-------------------------------",
+                        f"Shifts:   {shifts}",
+                        f"Location: {location}",
+                        f"Type:     {emp_type}",
+                        f"Pay:      {pay}",
+                        f"Job:      {title}",
+                        f"Link:     {link}",
+                        "-------------------------------",
+                    ])
+                    send_email(
+                        subject=f"🔔 New Ontario Job: {title} @ {location}",
+                        body=body
+                    )
+                    print(f"📧 Alert sent for: {title} @ {location}")
 
-                # 4) Pull all job cards via JS
-                jobs = await page.evaluate("""() => {
-                    const cards = Array.from(document.querySelectorAll('div.job-tile'));
-                    return cards.map(c => {
-                        const t = c.querySelector('.job-title');
-                        const l = c.querySelector('.job-location');
-                        const a = c.querySelector('a');
-                        return {
-                            title:    t    ? t.textContent.trim()    : 'N/A',
-                            location: l    ? l.textContent.trim()    : 'N/A',
-                            link:     a    ? a.href                  : '',
-                        };
-                    });
-                }""")
+        except Exception as e:
+            print("⚠️ Error fetching/sending:", e)
 
-                if not jobs:
-                    print("⏳ No new jobs right now.")
-                else:
-                    for job in jobs:
-                        link = job["link"]
-                        if not link or link in seen:
-                            continue
-                        seen.add(link)
-
-                        body = "\n".join([
-                            "-------------------------------",
-                            f"Job:      {job['title']}",
-                            f"Location: {job['location']}",
-                            f"Link:     {job['link']}",
-                            "-------------------------------",
-                        ])
-                        send_email(
-                            subject=f"🔔 New Ontario Job: {job['title']} @ {job['location']}",
-                            body=body
-                        )
-                        print(f"📧 Alert sent for: {job['title']} @ {job['location']}")
-
-            except Exception as e:
-                print("⚠️ Monitor loop error:", e)
-
-            # 5) Pause before next cycle
-            await asyncio.sleep(random.uniform(2, 5))
+        time.sleep(random.uniform(30, 60))
 
 if __name__ == "__main__":
-    asyncio.run(monitor_jobs())
+    main()
